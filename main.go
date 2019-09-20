@@ -2,7 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"expvar"
+	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -13,6 +16,7 @@ import (
 	"github.com/go-recaptcha/recaptcha"
 	"github.com/gorilla/handlers"
 	"github.com/kelseyhightower/envconfig"
+	badge "github.com/narqo/go-badge"
 	"github.com/nlopes/slack"
 	"github.com/paulbellamy/ratecounter"
 )
@@ -52,10 +56,21 @@ type Specification struct {
 	SlackToken     string `required:"true"`
 	CocUrl         string `required:"false" default:"http://coc.golangbridge.org/"`
 	EnforceHTTPS   bool
-	Debug          bool
+	Debug          bool // toggles nlopes/slack client's debug flag
 }
 
 func init() {
+	var showUsage = flag.Bool("h", false, "Show usage")
+	flag.Parse()
+
+	if *showUsage {
+		err := envconfig.Usage("slackinviter", &c)
+		if err != nil {
+			log.Fatal(err.Error())
+		}
+		os.Exit(0)
+	}
+
 	err := envconfig.Process("slackinviter", &c)
 	if err != nil {
 		log.Fatal(err.Error())
@@ -77,11 +92,26 @@ func init() {
 	m.Set("user_count", &userCount)
 
 	captcha = recaptcha.New(c.CaptchaSecret)
-	api = slack.New(c.SlackToken)
+	api = slack.New(c.SlackToken, slack.OptionDebug(c.Debug))
+}
 
-	if c.Debug {
-		api.SetDebug(true)
+func handleBadge(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+		return
 	}
+
+	users := userCount.String()
+	if activeUserCount.Value() > 0 {
+		users = activeUserCount.String() + "/" + userCount.String()
+	}
+
+	var buf bytes.Buffer
+	if err := badge.Render("slack", users, "#E01563", &buf); err != nil {
+		log.Fatal(err)
+	}
+	w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
+	buf.WriteTo(w)
 }
 
 func main() {
@@ -90,6 +120,7 @@ func main() {
 	mux.HandleFunc("/invite/", handleInvite)
 	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("./static"))))
 	mux.HandleFunc("/", enforceHTTPSFunc(homepage))
+	mux.HandleFunc("/badge.svg", handleBadge)
 	mux.Handle("/debug/vars", http.DefaultServeMux)
 	err := http.ListenAndServe(":"+c.Port, handlers.CombinedLoggingHandler(os.Stdout, mux))
 	if err != nil {
@@ -116,22 +147,41 @@ func enforceHTTPSFunc(h http.HandlerFunc) http.HandlerFunc {
 // returns the length of time to sleep before the function
 // should be called again
 func updateFromSlack() time.Duration {
-	users, err := api.GetUsers()
-	if err != nil {
-		log.Println("error polling slack for users:", err)
-		return time.Minute
-	}
-	var uCount, aCount int64 // users and active users
-	for _, u := range users {
-		if u.ID != "USLACKBOT" && !u.IsBot && !u.Deleted {
-			uCount++
-			if u.Presence == "active" {
-				aCount++
+	var (
+		err            error
+		p              slack.UserPagination
+		uCount, aCount int64 // users and active users
+	)
+
+	ctx := context.Background()
+	for p = api.GetUsersPaginated(
+		slack.GetUsersOptionPresence(true),
+		slack.GetUsersOptionLimit(500),
+	); !p.Done(err); p, err = p.Next(ctx) {
+		if err != nil {
+			if rle, ok := err.(*slack.RateLimitedError); ok {
+				fmt.Printf("Being Rate Limited by Slack: %s\n", rle)
+				time.Sleep(rle.RetryAfter)
+				continue
 			}
 		}
+		for _, u := range p.Users {
+			if u.ID != "USLACKBOT" && !u.IsBot && !u.Deleted {
+				uCount++
+				if u.Presence == "active" {
+					aCount++
+				}
+			}
+		}
+		fmt.Println("User Count:", uCount)
+		fmt.Println("Active Count:", aCount)
 	}
 	userCount.Set(uCount)
 	activeUserCount.Set(aCount)
+	if err != nil && !p.Done(err) {
+		log.Println("error polling slack for users:", err)
+		return time.Minute
+	}
 
 	st, err := api.GetTeamInfo()
 	if err != nil {
@@ -139,7 +189,7 @@ func updateFromSlack() time.Duration {
 		return time.Minute
 	}
 	ourTeam.Update(st)
-	return 10 * time.Minute
+	return time.Hour
 }
 
 // pollSlack over and over again
@@ -188,26 +238,6 @@ func handleInvite(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 		return
 	}
-	captchaResponse := r.FormValue("g-recaptcha-response")
-	remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		failedCaptcha.Add(1)
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		return
-	}
-
-	valid, err := captcha.Verify(captchaResponse, remoteIP)
-	if err != nil {
-		failedCaptcha.Add(1)
-		http.Error(w, "Error validating recaptcha.. Did you click it?", http.StatusPreconditionFailed)
-		return
-	}
-	if !valid {
-		invalidCaptcha.Add(1)
-		http.Error(w, "Invalid recaptcha", http.StatusInternalServerError)
-		return
-
-	}
 	successfulCaptcha.Add(1)
 	fname := r.FormValue("fname")
 	lname := r.FormValue("lname")
@@ -233,6 +263,27 @@ func handleInvite(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "You need to accept the code of conduct", http.StatusPreconditionFailed)
 		return
 	}
+	remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		failedCaptcha.Add(1)
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
+
+	captchaResponse := r.FormValue("g-recaptcha-response")
+	valid, err := captcha.Verify(captchaResponse, remoteIP)
+	if err != nil {
+		failedCaptcha.Add(1)
+		http.Error(w, "Error validating recaptcha.. Did you click it?", http.StatusPreconditionFailed)
+		return
+	}
+	if !valid {
+		invalidCaptcha.Add(1)
+		http.Error(w, "Invalid recaptcha", http.StatusInternalServerError)
+		return
+
+	}
+	// all is well, let's try to invite someone!
 	err = api.InviteToTeam(ourTeam.Domain(), fname, lname, email)
 	if err != nil {
 		log.Println("InviteToTeam error:", err)
